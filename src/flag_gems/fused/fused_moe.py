@@ -1307,7 +1307,9 @@ def fused_moe_kernel(
                 acc_gate = acc_gate * a_scale * b_scale_gate
 
         if HAS_BIAS:
-            gate_bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn_gate * stride_bbn
+            gate_bias_ptrs = (
+                b_bias_ptr + off_experts * stride_bbe + offs_bn_gate * stride_bbn
+            )
             gate_bias = tl.load(gate_bias_ptrs, mask=(offs_bn_gate < N_out), other=0.0)
             acc_gate += gate_bias[None, :]
 
@@ -1364,7 +1366,9 @@ def fused_moe_kernel(
                 acc_up = acc_up * a_scale * b_scale_up
 
         if HAS_BIAS:
-            up_bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn_up * stride_bbn
+            up_bias_ptrs = (
+                b_bias_ptr + off_experts * stride_bbe + offs_bn_up * stride_bbn
+            )
             up_bias = tl.load(up_bias_ptrs, mask=(offs_bn_up < N), other=0.0)
             acc_up += up_bias[None, :]
 
@@ -2010,8 +2014,9 @@ def fused_experts_impl(
     direct_sum_supported = is_plain_half_config or is_fp8_blockwise
 
     # Check if we can safely fuse the activation with the first GEMM pass
-    can_use_fused_silu = (
-        activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+    can_use_fused_silu = activation_enum in (
+        MoEActivation.SILU,
+        MoEActivation.SWIGLUOAI,
     )
 
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
