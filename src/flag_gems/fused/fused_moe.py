@@ -1184,6 +1184,21 @@ def fused_moe_kernel(
         )
 
     elif FUSE_SILU:
+        if off_experts == -1:
+            write_zeros_to_output(
+                c_ptr,
+                stride_cm,
+                stride_cn,
+                pid_n,
+                N_out,
+                offs_token,
+                token_mask,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                compute_type,
+            )
+            return
+
         offs_bn_gate = offs_bn
         offs_bn_up = offs_bn + N_out
 
@@ -1291,6 +1306,11 @@ def fused_moe_kernel(
             else:
                 acc_gate = acc_gate * a_scale * b_scale_gate
 
+        if HAS_BIAS:
+            gate_bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn_gate * stride_bbn
+            gate_bias = tl.load(gate_bias_ptrs, mask=(offs_bn_gate < N_out), other=0.0)
+            acc_gate += gate_bias[None, :]
+
         # Pass 2: Sequential up projection; operand A is reloaded with high L1 hit rate.
         a_ptrs = a_base + offs_k[None, :] * stride_ak
         acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -1342,6 +1362,11 @@ def fused_moe_kernel(
                 acc_up = acc_up * a_scale * b_scale_up
             else:
                 acc_up = acc_up * a_scale * b_scale_up
+
+        if HAS_BIAS:
+            up_bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn_up * stride_bbn
+            up_bias = tl.load(up_bias_ptrs, mask=(offs_bn_up < N), other=0.0)
+            acc_up += up_bias[None, :]
 
         # SiLU activation fusion
         accumulator = tl.fdiv(acc_gate, (1.0 + tl.exp(-acc_gate))) * acc_up
@@ -1987,8 +2012,6 @@ def fused_experts_impl(
     # Check if we can safely fuse the activation with the first GEMM pass
     can_use_fused_silu = (
         activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
-        and w1_bias is None
-        and expert_map is None  # Fused kernel doesn't handle EP -1 experts
     )
 
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
