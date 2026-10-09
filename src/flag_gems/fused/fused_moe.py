@@ -29,7 +29,7 @@ import yaml
 from flag_gems.fused.moe_align_block_size import moe_align_block_size
 from flag_gems.fused.moe_sum import moe_sum
 from flag_gems.runtime import device, torch_device_fn
-from flag_gems.utils import pointwise_dynamic
+from flag_gems.utils import pointwise_dynamic, tl_extra_shim
 
 logger = logging.getLogger(__name__)
 
@@ -658,6 +658,135 @@ def _swigluoai_uninterleave_kernel(
     )
 
 
+@triton.jit
+def _swigluoai_uninterleave_quant_kernel(
+    input_ptr,
+    q_ptr,
+    scale_ptr,
+    n_inter,
+    stride_im,
+    stride_in,
+    stride_qm,
+    stride_qn,
+    alpha,
+    beta,
+    clamp_limit,
+    eps,
+    INT8_MIN: tl.constexpr,
+    INT8_MAX: tl.constexpr,
+    ACT_DTYPE: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    """SwiGLU-OAI fused with the per-token INT8 quantization GEMM2 needs.
+
+    One program owns a whole row, so the activated values stay in registers and
+    the BF16/FP16 workspace never reaches memory. The activation is still rounded
+    to ``ACT_DTYPE`` before amax and the divide, which keeps this bit-identical
+    to running ``_swigluoai_uninterleave_kernel`` and ``_int8_quantize`` in
+    sequence.
+    """
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_I)
+    mask = cols < n_inter
+    gate = tl.load(
+        input_ptr + row * stride_im + cols * stride_in, mask=mask, other=0.0
+    ).to(tl.float32)
+    up = tl.load(
+        input_ptr + row * stride_im + (n_inter + cols) * stride_in,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    gate = tl.minimum(gate, clamp_limit)
+    up = tl.minimum(tl.maximum(up, -clamp_limit), clamp_limit)
+    activated = gate * tl.sigmoid(alpha * gate) * (up + beta)
+    # Round through the activation dtype exactly where the unfused path stores
+    # its workspace, then quantize from that rounded value.
+    activated = activated.to(ACT_DTYPE).to(tl.float32)
+
+    amax = tl.max(tl.where(mask, tl.abs(activated), 0.0))
+    amax = tl.maximum(amax, eps)
+    scale = amax / INT8_MAX
+    tl.store(scale_ptr + row, scale)
+
+    q = tl_extra_shim.rint(tl_extra_shim.div_rn(activated, scale))
+    q = tl.where(q != q, 0.0, q)
+    q = tl.minimum(tl.maximum(q, INT8_MIN), INT8_MAX)
+    tl.store(q_ptr + row * stride_qm + cols * stride_qn, q.to(tl.int8), mask=mask)
+
+
+# A fused row must stay resident in registers; wider rows keep the split path.
+_OAI_QUANT_FUSION_MAX_WIDTH = 4096
+
+
+def _can_fuse_oai_quant(
+    activation_enum: "MoEActivation",
+    cache2: torch.Tensor,
+    quant_dtype: torch.dtype | None,
+    per_channel_quant: bool,
+    block_shape: Optional[list[int]],
+    ocp_mx_scheme: str | None,
+    a2_scale: Optional[torch.Tensor],
+) -> bool:
+    """Whether GEMM2's input can come from the fused activation+quant kernel."""
+    return (
+        activation_enum == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        and quant_dtype == torch.int8
+        and per_channel_quant
+        and block_shape is None
+        and ocp_mx_scheme is None
+        and a2_scale is None  # dynamic scales only; static ones skip amax
+        and cache2.dtype in (torch.bfloat16, torch.float16)
+        and cache2.ndim == 2
+        and cache2.stride(1) == 1
+        and 0 < cache2.size(1) <= _OAI_QUANT_FUSION_MAX_WIDTH
+    )
+
+
+def _swigluoai_uninterleave_quant(
+    input: torch.Tensor,
+    n_inter: int,
+    act_dtype: torch.dtype,
+    *,
+    gemm1_alpha: float,
+    gemm1_beta: float,
+    gemm1_clamp_limit: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Activate ``input`` and return GEMM2's INT8 operand plus its scales."""
+    rows = input.size(0)
+    q = torch.empty((rows, n_inter), device=input.device, dtype=torch.int8)
+    scale = torch.empty((rows, 1), device=input.device, dtype=torch.float32)
+    if rows == 0 or n_inter == 0:
+        return q, scale
+
+    iinfo = torch.iinfo(torch.int8)
+    # Match the eager clamp, which happens while amax is still in act dtype.
+    eps = float(torch.tensor(1e-10, dtype=act_dtype))
+    tl_act_dtype = tl.bfloat16 if act_dtype == torch.bfloat16 else tl.float16
+    block_i = triton.next_power_of_2(n_inter)
+
+    with torch_device_fn.device(input.device):
+        _swigluoai_uninterleave_quant_kernel[(rows,)](
+            input,
+            q,
+            scale,
+            n_inter,
+            input.stride(0),
+            input.stride(1),
+            q.stride(0),
+            q.stride(1),
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
+            eps,
+            INT8_MIN=iinfo.min,
+            INT8_MAX=iinfo.max,
+            ACT_DTYPE=tl_act_dtype,
+            BLOCK_I=block_i,
+            num_warps=4 if block_i <= 1024 else 8,
+        )
+    return q, scale
+
+
 def apply_moe_activation(
     activation: MoEActivation,
     output: torch.Tensor,
@@ -807,6 +936,130 @@ def _fp8_quantize(
             return A_q, scale.view(1)
 
 
+@triton.jit
+def _int8_quantize_rowwise_kernel(
+    a_ptr,
+    q_ptr,
+    scale_ptr,
+    M,
+    K,
+    stride_am,
+    stride_ak,
+    stride_qm,
+    stride_qk,
+    eps,
+    INT8_MIN: tl.constexpr,
+    INT8_MAX: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_FITS_BLOCK: tl.constexpr,
+):
+    """Row-wise (per-token) INT8 quantization in a single pass over A.
+
+    Each program handles ``ROWS_PER_BLOCK`` rows so that narrow rows still issue
+    wide coalesced loads. ``K_FITS_BLOCK`` keeps the whole row resident, which
+    lets amax and the divide share one load; otherwise the row is streamed twice.
+    """
+    row_block = tl.program_id(0)
+    rows = row_block * ROWS_PER_BLOCK + tl.arange(0, ROWS_PER_BLOCK)
+    row_mask = rows < M
+
+    if K_FITS_BLOCK:
+        cols = tl.arange(0, BLOCK_K)
+        mask = row_mask[:, None] & (cols[None, :] < K)
+        offs = rows[:, None] * stride_am + cols[None, :] * stride_ak
+        a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        # Reduce in the input dtype's value range, matching the eager path which
+        # takes amax before widening to fp32.
+        amax = tl.max(tl.abs(a), axis=1)
+        amax = tl.maximum(amax, eps)
+        scale = amax / INT8_MAX
+        tl.store(scale_ptr + rows, scale, mask=row_mask)
+        # div_rn matches torch's division bitwise; Triton's `/` can differ by one
+        # ulp, which is enough to flip rint at .5 boundaries.
+        q = tl_extra_shim.rint(tl_extra_shim.div_rn(a, scale[:, None]))
+        # An all-zero row whose eps flushed to zero divides 0/0; the eager path
+        # casts the resulting NaN to int8, which lands on zero. Guard before the
+        # clamp, which would otherwise resolve NaN to INT8_MIN.
+        q = tl.where(q != q, 0.0, q)
+        q = tl.minimum(tl.maximum(q, INT8_MIN), INT8_MAX)
+        q_offs = rows[:, None] * stride_qm + cols[None, :] * stride_qk
+        tl.store(q_ptr + q_offs, q.to(tl.int8), mask=mask)
+    else:
+        amax = tl.zeros((ROWS_PER_BLOCK,), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            cols = k * BLOCK_K + tl.arange(0, BLOCK_K)
+            mask = row_mask[:, None] & (cols[None, :] < K)
+            offs = rows[:, None] * stride_am + cols[None, :] * stride_ak
+            a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            amax = tl.maximum(amax, tl.max(tl.abs(a), axis=1))
+        amax = tl.maximum(amax, eps)
+        scale = amax / INT8_MAX
+        tl.store(scale_ptr + rows, scale, mask=row_mask)
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            cols = k * BLOCK_K + tl.arange(0, BLOCK_K)
+            mask = row_mask[:, None] & (cols[None, :] < K)
+            offs = rows[:, None] * stride_am + cols[None, :] * stride_ak
+            a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            q = tl_extra_shim.rint(tl_extra_shim.div_rn(a, scale[:, None]))
+            q = tl.where(q != q, 0.0, q)
+            q = tl.minimum(tl.maximum(q, INT8_MIN), INT8_MAX)
+            q_offs = rows[:, None] * stride_qm + cols[None, :] * stride_qk
+            tl.store(q_ptr + q_offs, q.to(tl.int8), mask=mask)
+
+
+# Rows are widened into one program until the tile reaches this many elements,
+# so a 384-wide GEMM2 activation still loads a full cache line per row.
+_INT8_QUANT_TILE_ELEMS = 4096
+# Rows wider than this stream in BLOCK_K chunks instead of staying resident.
+_INT8_QUANT_MAX_BLOCK_K = 8192
+
+
+def _int8_quantize_rowwise(
+    A_flat: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-pass per-token INT8 quantization of a 2D tensor.
+
+    Returns ``(A_q, scale)`` with ``scale`` shaped ``(M,)``; the caller reshapes.
+    """
+    M, K = A_flat.shape
+    A_q = torch.empty_like(A_flat, dtype=torch.int8)
+    scale = torch.empty(M, device=A_flat.device, dtype=torch.float32)
+    if M == 0 or K == 0:
+        return A_q, scale
+
+    # The eager path clamps amax while it is still in A's dtype, so round eps the
+    # same way before comparing in fp32. This matters for all-zero rows: bf16
+    # nudges eps upward and fp16 flushes it to zero.
+    eps = float(torch.tensor(eps, dtype=A_flat.dtype))
+    iinfo = torch.iinfo(torch.int8)
+    k_fits = K <= _INT8_QUANT_MAX_BLOCK_K
+    block_k = triton.next_power_of_2(K) if k_fits else _INT8_QUANT_MAX_BLOCK_K
+    rows_per_block = max(1, _INT8_QUANT_TILE_ELEMS // block_k)
+    num_warps = 4 if block_k <= 1024 else 8
+
+    with torch_device_fn.device(A_flat.device):
+        _int8_quantize_rowwise_kernel[(triton.cdiv(M, rows_per_block),)](
+            A_flat,
+            A_q,
+            scale,
+            M,
+            K,
+            A_flat.stride(0),
+            A_flat.stride(1),
+            A_q.stride(0),
+            A_q.stride(1),
+            eps,
+            INT8_MIN=iinfo.min,
+            INT8_MAX=iinfo.max,
+            ROWS_PER_BLOCK=rows_per_block,
+            BLOCK_K=block_k,
+            K_FITS_BLOCK=k_fits,
+            num_warps=num_warps,
+        )
+    return A_q, scale
+
+
 def _int8_quantize(
     A: torch.Tensor,
     A_scale: Optional[torch.Tensor],
@@ -841,6 +1094,9 @@ def _int8_quantize(
 
     elif per_act_token:
         A_flat = A.reshape(-1, A.size(-1))
+        if A_flat.is_contiguous() or A_flat.stride(1) == 1:
+            A_q, scale = _int8_quantize_rowwise(A_flat, eps)
+            return A_q.reshape(A.shape), scale.reshape(A.shape[:-1] + (1,))
         amax = A_flat.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
         scale = amax / int8_max
         A_q = (A_flat.float() / scale).round().clamp(int8_min, int8_max).to(torch.int8)
@@ -2233,26 +2489,45 @@ def fused_experts_impl(
             FUSE_SILU=do_fuse_silu,  # Master switch for the kernel
         )
 
-        # 4. Apply activation separately if the fused path was not taken
-        if not do_fuse_silu:
-            apply_moe_activation(
-                activation_enum,
-                intermediate_cache2,
+        # 4/5. Activate and quantize for GEMM2. When the activation was not
+        # folded into GEMM1, SwiGLU-OAI can hand its registers straight to the
+        # quantizer and skip a round trip through the BF16 workspace.
+        fuse_oai_quant = not do_fuse_silu and _can_fuse_oai_quant(
+            activation_enum,
+            intermediate_cache2,
+            quant_dtype,
+            per_channel_quant,
+            block_shape,
+            ocp_mx_scheme,
+            a2_scale,
+        )
+        if fuse_oai_quant:
+            qintermediate_cache2, a2q_scale = _swigluoai_uninterleave_quant(
                 intermediate_cache1.view(-1, N),
+                intermediate_cache2.size(1),
+                intermediate_cache2.dtype,
                 gemm1_alpha=gemm1_alpha,
                 gemm1_beta=gemm1_beta,
                 gemm1_clamp_limit=gemm1_clamp_limit,
             )
-
-        # 5. Quantize activated intermediate for GEMM2
-        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-            A=intermediate_cache2,
-            A_scale=a2_scale,
-            quant_dtype=quant_dtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape,
-            ocp_mx_scheme=ocp_mx_scheme,
-        )
+        else:
+            if not do_fuse_silu:
+                apply_moe_activation(
+                    activation_enum,
+                    intermediate_cache2,
+                    intermediate_cache1.view(-1, N),
+                    gemm1_alpha=gemm1_alpha,
+                    gemm1_beta=gemm1_beta,
+                    gemm1_clamp_limit=gemm1_clamp_limit,
+                )
+            qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+                A=intermediate_cache2,
+                A_scale=a2_scale,
+                quant_dtype=quant_dtype,
+                per_act_token_quant=per_channel_quant,
+                block_shape=block_shape,
+                ocp_mx_scheme=ocp_mx_scheme,
+            )
 
         if expert_map is not None:
             intermediate_cache3.zero_()
