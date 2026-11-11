@@ -436,7 +436,10 @@ def topk_deepselect_kernel(
     # Per-slot partial results (segmented layout) follow all candidate areas,
     # then one threshold per slot.
     pbuf = BUF + num_progs.to(tl.int64) * (2 * CAP)
-    tbuf = pbuf + n_slots.to(tl.int64) * K
+    # `n_slots == 1` (a single row that fits one segment) makes Triton fold the
+    # argument to a constant, and a Python int has no `.to()`.  Routing it
+    # through an int64 scalar keeps one code path for constants and tensors.
+    tbuf = pbuf + (tl.full((), 0, tl.int64) + n_slots) * K
 
     for slot in range(pid, n_slots, num_progs):
         row = slot // segs_per_row
